@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Convierte el .dmg de RustDesk en VexlyRemoto con la configuración adentro.
+#   canela/rebrand-macos.sh <rustdesk.dmg> <custom.txt> <salida.dmg>
+#   Opcionales: ICON=<.icns> (ícono de la variante) VOLNAME="<nombre del volumen del dmg>"
+#
+# Por qué no es cosmético: en macOS RustDesk arma las rutas de su servicio con el nombre
+# de la app (/Applications/{APP}.app/Contents/MacOS/{APP}). Con custom.txt diciendo
+# "VexlyRemoto", el bundle TIENE que llamarse VexlyRemoto.app y su ejecutable
+# VexlyRemoto, o el LaunchAgent/LaunchDaemon apuntan a rutas que no existen.
+set -euo pipefail
+DMG="$1"; CUSTOM="$2"; OUT="$3"
+APP_NAME="${APP_NAME:-VexlyRemoto}"
+BUNDLE_ID="${BUNDLE_ID:-com.vexlyapp.remoto}"
+SCHEME="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
+W="$(mktemp -d)"; MNT="$W/mnt"; SRC="$W/src"; mkdir -p "$MNT" "$SRC"
+trap 'hdiutil detach "$MNT" -quiet 2>/dev/null || true; rm -rf "$W"' EXIT
+
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" -quiet
+ORIG="$(find "$MNT" -maxdepth 1 -name '*.app' | head -1)"
+[ -n "$ORIG" ] || { echo "no hay .app dentro de $DMG"; exit 1; }
+APP="$SRC/$APP_NAME.app"
+ditto "$ORIG" "$APP"
+hdiutil detach "$MNT" -quiet
+
+PL="$APP/Contents/Info.plist"; PB=/usr/libexec/PlistBuddy
+OLD_EXE="$($PB -c 'Print :CFBundleExecutable' "$PL")"
+# entitlements originales (si la app venía firmada ad-hoc por Xcode) para conservarlos
+ENT="$W/ent.plist"; codesign -d --entitlements :- "$APP" > "$ENT" 2>/dev/null || true
+
+[ "$OLD_EXE" != "$APP_NAME" ] && mv "$APP/Contents/MacOS/$OLD_EXE" "$APP/Contents/MacOS/$APP_NAME"
+$PB -c "Set :CFBundleExecutable $APP_NAME" "$PL"
+$PB -c "Set :CFBundleName $APP_NAME" "$PL"
+$PB -c "Delete :CFBundleDisplayName" "$PL" 2>/dev/null || true
+$PB -c "Add :CFBundleDisplayName string 'Vexly Remoto'" "$PL"
+$PB -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PL"
+$PB -c "Set :CFBundleURLTypes:0:CFBundleURLName $BUNDLE_ID" "$PL" 2>/dev/null || true
+$PB -c "Set :CFBundleURLTypes:0:CFBundleURLSchemes:0 $SCHEME" "$PL"
+cp "$CUSTOM" "$APP/Contents/Resources/custom.txt"
+if [ -n "${ICON:-}" ]; then
+  ICON_FILE="$($PB -c 'Print :CFBundleIconFile' "$PL" 2>/dev/null || echo AppIcon.icns)"
+  case "$ICON_FILE" in *.icns) ;; *) ICON_FILE="$ICON_FILE.icns";; esac
+  cp "$ICON" "$APP/Contents/Resources/$ICON_FILE"
+fi
+
+# Identidad de firma: SIGN_IDENTITY (certificado propio de Vexly, secreto del repo) o
+# ad-hoc ("-"). Con el certificado propio la firma es igual en cada versión y en cliente y
+# técnico: macOS conserva los permisos de Grabación de pantalla/Accesibilidad al actualizar
+# (con ad-hoc cada build es otro programa para TCC y hay que volver a darlos).
+SIGN="${SIGN_IDENTITY:--}"
+SIGN_OPTS=(--force --sign "$SIGN")
+[ "$SIGN" != "-" ] && SIGN_OPTS+=(--timestamp=none)
+
+# Sello nuevo, de adentro hacia afuera. OJO: el build sin firmar de RustDesk trae el
+# ejecutable ad-hoc CON hardened runtime y los frameworks SIN él → dyld rechaza FlutterMacOS
+# ("different Team IDs") y la app no abre ni siquiera la original. `codesign --force` conserva
+# esa marca, por eso primero se quita la firma de cada pieza. Firma real (Developer ID) +
+# notarización reemplazan esto cuando haya cuenta de Apple Developer.
+for piece in "$APP"/Contents/Frameworks/*.framework "$APP"/Contents/Frameworks/*.dylib "$APP"/Contents/MacOS/*; do
+  [ -e "$piece" ] || continue
+  [ "$piece" = "$APP/Contents/MacOS/$APP_NAME" ] && continue
+  codesign --remove-signature "$piece" 2>/dev/null || true
+  codesign "${SIGN_OPTS[@]}" "$piece"
+done
+codesign --remove-signature "$APP" 2>/dev/null || true
+if [ -s "$ENT" ] && grep -q "<dict>" "$ENT"; then
+  codesign "${SIGN_OPTS[@]}" --entitlements "$ENT" "$APP"
+else
+  codesign "${SIGN_OPTS[@]}" "$APP"
+fi
+codesign --verify --deep --strict "$APP"
+codesign -d -r- "$APP" 2>&1 | grep -i "designated" || true
+
+# Prueba de humo: si la arquitectura coincide con la de esta máquina, la app tiene que arrancar.
+BIN="$APP/Contents/MacOS/$APP_NAME"
+if lipo -archs "$BIN" 2>/dev/null | grep -qw "$(uname -m)"; then
+  V="$(perl -e 'alarm 30; exec @ARGV' "$BIN" --version 2>&1 | tail -1)"
+  echo "$V" | grep -qE '^[0-9]+\.[0-9]+' || { echo "✗ la app no arranca: $V"; exit 1; }
+  echo "  arranca: $APP_NAME $V"
+fi
+
+ln -s /Applications "$SRC/Applications"
+rm -f "$OUT"
+hdiutil create -volname "${VOLNAME:-$APP_NAME}" -srcfolder "$SRC" -format UDZO -quiet "$OUT"
+echo "✓ $OUT ($APP_NAME.app, $BUNDLE_ID, esquema $SCHEME://)"

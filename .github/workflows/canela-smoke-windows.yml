@@ -1,0 +1,56 @@
+# Prueba de humo de los instaladores de Windows publicados: abre cada .exe como lo haría un
+# usuario (doble clic, sin argumentos) y exige que la ventana "VexlyRemoto" siga abierta a
+# los 45 s. Corre sola al final de "VexlyRemoto build" y también a mano (Run workflow).
+name: VexlyRemoto - prueba Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "Archivos del release a probar (glob)"
+        default: "vexlyremoto*-x86_64.exe"
+      tag:
+        default: vexly-dev
+  workflow_call:
+    inputs:
+      pattern:
+        type: string
+        default: "vexlyremoto*-x86_64.exe"
+      tag:
+        type: string
+        default: vexly-dev
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-2022
+    steps:
+      - name: Descargar
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" -R "${{ github.repository }}" -p "${{ inputs.pattern }}" -D C:\dl
+          Get-ChildItem C:\dl
+      - name: Abrir como usuario
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($f in Get-ChildItem C:\dl -Filter *.exe) {
+            Remove-Item -Recurse -Force "$env:LOCALAPPDATA\rustdesk", "$env:APPDATA\VexlyRemoto" -ErrorAction SilentlyContinue
+            Start-Process $f.FullName | Out-Null
+            Start-Sleep -Seconds 45
+            $procs = Get-Process | Where-Object { $_.Name -match 'canela|rustdesk' }
+            $win = $procs | Where-Object { $_.MainWindowTitle -like 'Vexly Remoto*' }
+            "=== $($f.Name): ventana=$([bool]$win)"
+            $procs | Format-Table Id, Name, MainWindowTitle -AutoSize | Out-String -Width 200
+            if (-not $win) {
+              $failed += $f.Name
+              Get-ChildItem "$env:APPDATA\VexlyRemoto\log" -Recurse -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { "== $($_.FullName)"; Get-Content $_.FullName -Tail 40 }
+            }
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+          }
+          if ($failed.Count) { Write-Error "No abrieron: $($failed -join ', ')"; exit 1 }

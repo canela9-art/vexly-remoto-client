@@ -1,0 +1,136 @@
+# VexlyRemoto — compilación manual del cliente (Actions → "VexlyRemoto build" → Run workflow).
+# Reutiliza el workflow de upstream sin tocarlo, para que rebasear a un tag nuevo sea trivial.
+# Los binarios quedan como artifacts del run y en un prerelease con la etiqueta indicada.
+#
+# Instaladores con marca (vexlyremoto-*):
+#   · Windows: los arma el propio job de Windows (parche 8 en flutter-build.yml).
+#   · macOS:   job canela-macos de abajo, a partir del .dmg sin firmar de ese mismo run.
+#   · Android: job canela-android — mete custom.txt en el APK (parche 9 lo lee) y re-firma
+#     con la llave propia (secretos CANELA_ANDROID_KEYSTORE / _PASS).
+#   · Prueba: canela-windows-smoke abre los .exe x86_64 publicados y exige la ventana.
+#   · Linux: sigue genérico (rustdesk-*); se configura con `rustdesk --config`.
+# Sin secretos de firma, Windows/macOS salen SIN firmar (sirven para pruebas internas).
+name: VexlyRemoto build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload-tag:
+        description: "Etiqueta del prerelease donde subir los binarios"
+        type: string
+        default: "vexly-dev"
+
+# El GITHUB_TOKEN de un fork es de solo lectura por defecto; los pasos "Publish" de
+# flutter-build.yml crean/actualizan el prerelease y necesitan escribir contenidos.
+permissions:
+  contents: write
+  actions: read   # canela-macos baja artifacts por run-id
+
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ inputs.upload-tag }}
+
+  canela-macos:
+    name: VexlyRemoto - dmg macOS (cliente y técnico)
+    needs: build
+    # corre aunque falle algún job ajeno (p. ej. Flatpak por red); si falta un dmg, lo salta
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/canela-macos.yml
+    secrets: inherit
+    with:
+      upload-tag: ${{ inputs.upload-tag }}
+      build: ${{ github.run_number }}
+
+  canela-android:
+    name: VexlyRemoto - apk Android (cliente y técnico)
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Rebrand y firma
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KS_B64: ${{ secrets.CANELA_ANDROID_KEYSTORE }}
+          KS_PASS: ${{ secrets.CANELA_ANDROID_KEYSTORE_PASS }}
+        run: |
+          set -euo pipefail
+          [ -n "$KS_B64" ] || { echo "Sin llave de Android (CANELA_ANDROID_KEYSTORE): se omite."; exit 0; }
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1); echo "build-tools: $BT"
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/ks.jks"
+          mkdir -p in out
+          gh release download "${{ inputs.upload-tag }}" -R "${{ github.repository }}" \
+            -p "rustdesk-$VERSION-universal.apk" -p "rustdesk-$VERSION-aarch64.apk" -D in
+          for apk in in/*.apk; do
+            case "$apk" in *universal*) arch=universal;; *aarch64*) arch=aarch64;; *) continue;; esac
+            for variant in cliente tecnico; do
+              suffix=""; [ "$variant" = "tecnico" ] && suffix="-tecnico"
+              work="$RUNNER_TEMP/work.apk"; cp "$apk" "$work"
+              # quitar la firma v1 vieja (la v2/v3 la descarta zipalign al reescribir el archivo)
+              zip -q -d "$work" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' || true
+              stage="$RUNNER_TEMP/stage"; rm -rf "$stage"; mkdir -p "$stage/assets/flutter_assets/assets"
+              cp "canela/custom-$variant.txt" "$stage/assets/flutter_assets/assets/canela_custom.txt"
+              (cd "$stage" && zip -q "$work" assets/flutter_assets/assets/canela_custom.txt)
+              # -P 16: bibliotecas nativas alineadas a 16 KB (Android 15+); -f 4 para el resto
+              "$BT/zipalign" -P 16 -f 4 "$work" "$RUNNER_TEMP/aligned.apk" || "$BT/zipalign" -p -f 4 "$work" "$RUNNER_TEMP/aligned.apk"
+              outapk="out/vexlyremoto$suffix-$VERSION.${{ github.run_number }}-$arch.apk"
+              "$BT/apksigner" sign --ks "$RUNNER_TEMP/ks.jks" --ks-pass env:KS_PASS --ks-key-alias vexlyremoto --out "$outapk" "$RUNNER_TEMP/aligned.apk"
+              "$BT/apksigner" verify --print-certs "$outapk" | head -2
+              unzip -l "$outapk" | grep -q canela_custom.txt && echo "✓ $outapk con $variant"
+            done
+          done
+          rm -f "$RUNNER_TEMP/ks.jks"
+          ls -la out
+      - name: Publicar
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ inputs.upload-tag }}
+          files: out/vexlyremoto*.apk
+
+  # Abre los .exe de Windows ya publicados y falla si alguno no muestra la ventana.
+  canela-windows-smoke:
+    name: VexlyRemoto - prueba Windows
+    needs: build
+    if: ${{ !cancelled() }}
+    uses: ./.github/workflows/canela-smoke-windows.yml
+    with:
+      tag: ${{ inputs.upload-tag }}
+
+  # Publica el número de build solo si todo salió y la prueba de Windows pasó: con eso las apps
+  # instaladas ven "Actualizar" (POST /api/canela/update lee canela-build.json del release).
+  canela-release-info:
+    name: VexlyRemoto - publicar versión (actualización)
+    needs: [build, canela-macos, canela-android, canela-windows-smoke]
+    if: ${{ !cancelled() && needs.canela-windows-smoke.result == 'success' && needs.canela-macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          sparse-checkout: Cargo.toml
+      - name: canela-build.json
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          printf '{"build":%s,"version":"%s","sha":"%s","published_at":"%s"}\n' \
+            "${{ github.run_number }}" "$VERSION" "${{ github.sha }}" "$(date -u +%FT%TZ)" > canela-build.json
+          cat canela-build.json
+      - uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
+        with:
+          prerelease: true
+          tag_name: ${{ inputs.upload-tag }}
+          files: canela-build.json
+      - name: Borrar instaladores de builds anteriores
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # quedan solo los vexlyremoto-*.<este build>-*: así el panel y la actualización no ven dos
+          gh release view "${{ inputs.upload-tag }}" -R "${{ github.repository }}" --json assets --jq '.assets[].name' \
+            | grep '^vexlyremoto' | grep -v "\.${{ github.run_number }}-" | while read -r a; do
+                echo "borrando $a"; gh release delete-asset "${{ inputs.upload-tag }}" "$a" -R "${{ github.repository }}" -y
+              done
