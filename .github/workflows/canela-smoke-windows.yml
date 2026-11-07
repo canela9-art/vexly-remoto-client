@@ -42,7 +42,7 @@ jobs:
             Remove-Item -Recurse -Force "$env:LOCALAPPDATA\rustdesk", "$env:APPDATA\VexlyRemoto" -ErrorAction SilentlyContinue
             Start-Process $f.FullName | Out-Null
             Start-Sleep -Seconds 45
-            $procs = Get-Process | Where-Object { $_.Name -match 'canela|rustdesk' }
+            $procs = Get-Process | Where-Object { $_.Name -match 'VexlyRemoto|rustdesk' }
             $win = $procs | Where-Object { $_.MainWindowTitle -like 'Vexly Remoto*' }
             "=== $($f.Name): ventana=$([bool]$win)"
             $procs | Format-Table Id, Name, MainWindowTitle -AutoSize | Out-String -Width 200
