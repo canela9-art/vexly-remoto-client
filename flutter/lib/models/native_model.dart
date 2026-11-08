@@ -214,8 +214,8 @@ class PlatformFFI {
       await _ffiBind.mainSetHomeDir(home: _homeDir);
       await _ffiBind.mainInit(
         appDir: _dir,
-        // VexlyRemoto: en Android no hay carpeta junto al ejecutable; la config viaja en el APK
-        customClientConfig: Platform.isAndroid
+        // VexlyRemoto: en Android e iOS no hay carpeta junto al ejecutable; la config viaja dentro de la app
+        customClientConfig: Platform.isAndroid || Platform.isIOS
             ? await rootBundle.loadString('assets/canela_custom.txt', cache: false).then((s) => s.trim(), onError: (_) => '')
             : '',
       );
